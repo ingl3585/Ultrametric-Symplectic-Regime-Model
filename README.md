@@ -6,10 +6,11 @@ Research project for a bar-based trading engine that:
 - Within each regime, uses a simple **Hamiltonian (symplectic)** model to forecast the **next bar's** direction.
 - Exposes a clean **signal API** that can later be wired into **NinjaTrader Simulation / Playback** for NQ.
 
-> Status: **Phase 1 Complete** (Implementation & Initial Validation)
+> Status: **Phase 1 & 2 Complete** (Implementation, Validation & NinjaTrader Integration)
 > Timeframe: **15-minute bars only** (no tick or 2-minute logic in v1)
 > Instruments: **QQQ** for initial research, **NQ** via NinjaTrader for playback
 > Results: See `RESULTS.md` for detailed analysis
+> Integration: See `NINJATRADER_INTEGRATION.md` for live trading setup
 
 ---
 
