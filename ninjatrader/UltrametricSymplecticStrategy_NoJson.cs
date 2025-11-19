@@ -24,10 +24,7 @@ using NinjaTrader.NinjaScript.DrawingTools;
 // HTTP Client for API calls
 using System.Net.Http;
 using System.Net.Http.Headers;
-
-// JSON serialization
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
+using System.Globalization;
 #endregion
 
 //This namespace holds Strategies in this folder and is required. Do not change it.
@@ -36,14 +33,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 	/// <summary>
 	/// Ultrametric-Symplectic Regime Model Strategy for NinjaTrader 8
 	///
+	/// NO EXTERNAL DEPENDENCIES VERSION - No Newtonsoft.Json required
+	///
 	/// Calls external Python API on bar close to get trading signals.
 	/// Supports 15-minute bars only (as specified in project requirements).
 	///
 	/// REQUIREMENTS:
 	/// 1. Python FastAPI server must be running (python server/app.py)
-	/// 2. Add references to strategy:
-	///    - System.Net.Http
-	///    - Newtonsoft.Json (download from NuGet if needed)
+	/// 2. Add reference to: System.Net.Http
 	/// 3. Configure API URL in strategy properties
 	///
 	/// USAGE:
@@ -72,6 +69,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 		// Performance tracking
 		private int totalSignals = 0;
 		private int tradesExecuted = 0;
+
+		// State tracking
+		private bool hasTransitionedToRealtime = false;
 		#endregion
 
 		#region OnStateChange
@@ -79,7 +79,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			if (State == State.SetDefaults)
 			{
-				Description									= @"Ultrametric-Symplectic trading strategy that calls external Python API";
+				Description									= @"Ultrametric-Symplectic trading strategy that calls external Python API (No JSON dependency)";
 				Name										= "UltrametricSymplecticStrategy";
 				Calculate									= Calculate.OnBarClose;  // CRITICAL: Only on bar close
 				EntriesPerDirection							= 1;
@@ -105,9 +105,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 			}
 			else if (State == State.Configure)
 			{
-				// Add 15-minute data series (primary)
-				// Note: The chart you apply this to should already be 15-minute
-				// This is just defensive coding
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -130,8 +127,13 @@ namespace NinjaTrader.NinjaScript.Strategies
 					httpClient = null;
 				}
 
-				Print(string.Format("{0} terminated - Signals: {1}, Trades: {2}",
-					Name, totalSignals, tradesExecuted));
+				// Only log termination if we actually traded or transitioned to real-time
+				// This prevents spam during internal restarts on startup
+				if (hasTransitionedToRealtime || totalSignals > 0 || tradesExecuted > 0)
+				{
+					Print(string.Format("{0} terminated - Signals: {1}, Trades: {2}",
+						Name, totalSignals, tradesExecuted));
+				}
 			}
 		}
 		#endregion
@@ -149,6 +151,21 @@ namespace NinjaTrader.NinjaScript.Strategies
 			// Only process on primary data series (15-minute bars)
 			if (BarsInProgress != 0)
 				return;
+
+			// IMPORTANT: Only call API during real-time execution, not historical processing
+			// This prevents spamming the API with 100+ calls on strategy startup
+			if (State != State.Realtime)
+			{
+				// Skip historical bars - model is stateless, no need to call API
+				return;
+			}
+
+			// Log once when transitioning to real-time
+			if (!hasTransitionedToRealtime)
+			{
+				hasTransitionedToRealtime = true;
+				Print("*** READY TO TRADE - Historical processing complete, now monitoring live bars ***");
+			}
 
 			try
 			{
@@ -182,57 +199,62 @@ namespace NinjaTrader.NinjaScript.Strategies
 		{
 			try
 			{
-				// Build bar data array
-				var bars = new List<BarData>();
+				// Build JSON manually (no Newtonsoft dependency)
+				StringBuilder jsonBuilder = new StringBuilder();
+				jsonBuilder.Append("{");
 
-				// Get last K bars
+				// Add bars array
+				jsonBuilder.Append("\"bars\":[");
 				int startBar = Math.Max(0, CurrentBar - BarsToSend + 1);
 				for (int i = startBar; i <= CurrentBar; i++)
 				{
-					bars.Add(new BarData
-					{
-						timestamp = Time[CurrentBar - i].ToString("yyyy-MM-ddTHH:mm:ssZ"),
-						open = Open[CurrentBar - i],
-						high = High[CurrentBar - i],
-						low = Low[CurrentBar - i],
-						close = Close[CurrentBar - i],
-						volume = Volume[CurrentBar - i]
-					});
+					if (i > startBar)
+						jsonBuilder.Append(",");
+
+					int lookbackIndex = CurrentBar - i;
+					jsonBuilder.AppendFormat(CultureInfo.InvariantCulture,
+						"{{\"timestamp\":\"{0}\",\"open\":{1},\"high\":{2},\"low\":{3},\"close\":{4},\"volume\":{5}}}",
+						Time[lookbackIndex].ToString("yyyy-MM-ddTHH:mm:ssZ"),
+						Open[lookbackIndex],
+						High[lookbackIndex],
+						Low[lookbackIndex],
+						Close[lookbackIndex],
+						Volume[lookbackIndex]);
 				}
+				jsonBuilder.Append("],");
 
-				// Build request payload
-				// Note: Account field is optional in Python API
-				var requestData = new
-				{
-					bars = bars,
-					instrument = Instrument.FullName,
-					account = new
-					{
-						account_id = Account.Name,
-						cash_value = Account.Get(AccountItem.CashValue, Currency.UsDollar),
-						realized_pnl = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar),
-						unrealized_pnl = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar),
-						total_buying_power = Account.Get(AccountItem.BuyingPower, Currency.UsDollar),
-						position_quantity = Position.Quantity,
-						position_avg_price = Position.AveragePrice
-					}
-				};
+				// Add instrument
+				jsonBuilder.AppendFormat("\"instrument\":\"{0}\",", EscapeJsonString(Instrument.FullName));
 
-				// Serialize to JSON
-				string jsonContent = JsonConvert.SerializeObject(requestData);
+				// Add account info
+				jsonBuilder.AppendFormat(CultureInfo.InvariantCulture,
+					"\"account\":{{\"account_id\":\"{0}\",\"cash_value\":{1},\"realized_pnl\":{2},\"unrealized_pnl\":{3},\"total_buying_power\":{4},\"position_quantity\":{5},\"position_avg_price\":{6}}}",
+					EscapeJsonString(Account.Name),
+					Account.Get(AccountItem.CashValue, Currency.UsDollar),
+					Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar),
+					Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar),
+					Account.Get(AccountItem.BuyingPower, Currency.UsDollar),
+					Position.Quantity,
+					Position.AveragePrice);
+
+				jsonBuilder.Append("}");
+
+				string jsonContent = jsonBuilder.ToString();
 				var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
 				// Make synchronous HTTP POST
-				// Note: async is problematic in NinjaScript, using .Result for simplicity
 				var response = httpClient.PostAsync("/signal", content).Result;
 
 				if (response.IsSuccessStatusCode)
 				{
 					string responseContent = response.Content.ReadAsStringAsync().Result;
-					var signal = JsonConvert.DeserializeObject<TradingSignal>(responseContent);
+					var signal = ParseSignalResponse(responseContent);
 
-					Print(string.Format("Signal received: Direction={0}, Size={1:F2}, Model={2}",
-						signal.direction, signal.size_factor, signal.model_used));
+					if (signal != null)
+					{
+						Print(string.Format("Signal received: Direction={0}, Size={1:F2}, Model={2}",
+							signal.direction, signal.size_factor, signal.model_used));
+					}
 
 					return signal;
 				}
@@ -250,6 +272,36 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 
 		/// <summary>
+		/// Parse JSON response manually (no Newtonsoft dependency)
+		/// </summary>
+		private TradingSignal ParseSignalResponse(string json)
+		{
+			try
+			{
+				var signal = new TradingSignal();
+
+				// Extract direction
+				signal.direction = ExtractIntValue(json, "direction");
+
+				// Extract size_factor
+				signal.size_factor = ExtractDoubleValue(json, "size_factor");
+
+				// Extract model_used
+				signal.model_used = ExtractStringValue(json, "model_used");
+
+				// Extract timestamp
+				signal.timestamp = ExtractStringValue(json, "timestamp");
+
+				return signal;
+			}
+			catch (Exception ex)
+			{
+				Print(string.Format("ERROR parsing signal response: {0}", ex.Message));
+				return null;
+			}
+		}
+
+		/// <summary>
 		/// Log trade to Python API for monitoring
 		/// </summary>
 		private void LogTradeToAPI(string side, int quantity, double price, double pnl)
@@ -259,18 +311,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
 			try
 			{
-				var tradeLog = new
-				{
-					timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ssZ"),
-					instrument = Instrument.FullName,
-					side = side,
-					quantity = quantity,
-					price = price,
-					realized_pnl = pnl,
-					strategy = Name
-				};
+				// Build JSON manually
+				string jsonContent = string.Format(CultureInfo.InvariantCulture,
+					"{{\"timestamp\":\"{0}\",\"instrument\":\"{1}\",\"side\":\"{2}\",\"quantity\":{3},\"price\":{4},\"realized_pnl\":{5},\"strategy\":\"{6}\"}}",
+					DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+					EscapeJsonString(Instrument.FullName),
+					side,
+					quantity,
+					price,
+					pnl,
+					EscapeJsonString(Name));
 
-				string jsonContent = JsonConvert.SerializeObject(tradeLog);
 				var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
 
 				// Fire and forget (don't wait for response)
@@ -372,6 +423,89 @@ namespace NinjaTrader.NinjaScript.Strategies
 		}
 		#endregion
 
+		#region JSON Helper Methods
+
+		/// <summary>
+		/// Escape string for JSON
+		/// </summary>
+		private string EscapeJsonString(string str)
+		{
+			if (string.IsNullOrEmpty(str))
+				return str;
+
+			return str.Replace("\\", "\\\\")
+				.Replace("\"", "\\\"")
+				.Replace("\n", "\\n")
+				.Replace("\r", "\\r")
+				.Replace("\t", "\\t");
+		}
+
+		/// <summary>
+		/// Extract integer value from JSON string
+		/// </summary>
+		private int ExtractIntValue(string json, string key)
+		{
+			string pattern = string.Format("\"{0}\":", key);
+			int startIndex = json.IndexOf(pattern);
+			if (startIndex < 0)
+				return 0;
+
+			startIndex += pattern.Length;
+			int endIndex = json.IndexOfAny(new char[] { ',', '}' }, startIndex);
+			if (endIndex < 0)
+				endIndex = json.Length;
+
+			string valueStr = json.Substring(startIndex, endIndex - startIndex).Trim();
+			int value;
+			if (int.TryParse(valueStr, out value))
+				return value;
+
+			return 0;
+		}
+
+		/// <summary>
+		/// Extract double value from JSON string
+		/// </summary>
+		private double ExtractDoubleValue(string json, string key)
+		{
+			string pattern = string.Format("\"{0}\":", key);
+			int startIndex = json.IndexOf(pattern);
+			if (startIndex < 0)
+				return 0.0;
+
+			startIndex += pattern.Length;
+			int endIndex = json.IndexOfAny(new char[] { ',', '}' }, startIndex);
+			if (endIndex < 0)
+				endIndex = json.Length;
+
+			string valueStr = json.Substring(startIndex, endIndex - startIndex).Trim();
+			double value;
+			if (double.TryParse(valueStr, NumberStyles.Any, CultureInfo.InvariantCulture, out value))
+				return value;
+
+			return 0.0;
+		}
+
+		/// <summary>
+		/// Extract string value from JSON string
+		/// </summary>
+		private string ExtractStringValue(string json, string key)
+		{
+			string pattern = string.Format("\"{0}\":\"", key);
+			int startIndex = json.IndexOf(pattern);
+			if (startIndex < 0)
+				return "";
+
+			startIndex += pattern.Length;
+			int endIndex = json.IndexOf("\"", startIndex);
+			if (endIndex < 0)
+				return "";
+
+			return json.Substring(startIndex, endIndex - startIndex);
+		}
+
+		#endregion
+
 		#region Properties
 
 		[NinjaScriptProperty]
@@ -411,19 +545,6 @@ namespace NinjaTrader.NinjaScript.Strategies
 		#endregion
 
 		#region Helper Classes
-
-		/// <summary>
-		/// Bar data for API request
-		/// </summary>
-		private class BarData
-		{
-			public string timestamp { get; set; }
-			public double open { get; set; }
-			public double high { get; set; }
-			public double low { get; set; }
-			public double close { get; set; }
-			public double volume { get; set; }
-		}
 
 		/// <summary>
 		/// Trading signal from API

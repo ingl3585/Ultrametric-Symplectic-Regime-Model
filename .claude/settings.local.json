@@ -5,7 +5,8 @@
       "Bash(tree:*)",
       "Bash(python extend_template_data.py:*)",
       "Bash(python3:*)",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch(domain:ninjatrader.com)"
     ],
     "deny": [],
     "ask": []
