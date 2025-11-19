@@ -11,6 +11,8 @@ volume:
 signal:
   theta_ar1: 0.0001          # Threshold for AR(1) signals (in log space)
   theta_symplectic: 0.0001   # Threshold for symplectic signals (STEP 3+)
+  epsilon_gate: 1.0          # Max ultrametric distance to centroid for valid regime (STEP 4+)
+  hit_threshold: 0.50        # Minimum cluster hit rate to trade (STEP 4+)
 
 # Segment parameters (for STEP 1+)
 segments:
@@ -33,11 +35,6 @@ symplectic:
   dt: 1.0                    # Time step for leapfrog integrator
   kappa_min: 0.01            # Minimum allowed kappa
   kappa_max: 10.0            # Maximum allowed kappa
-
-# Gating parameters for hybrid model (for STEP 4+)
-gating:
-  epsilon_gate: 0.1          # Max distance to centroid for valid regime
-  hit_threshold: 0.52        # Minimum cluster hit rate to trade
 
 # Cost model (15-minute NQ approximation)
 costs:

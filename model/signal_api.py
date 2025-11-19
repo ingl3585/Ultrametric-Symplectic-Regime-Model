@@ -14,7 +14,7 @@ All models expose a get_signal(...) method that returns:
 """
 
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple
 
 from .symplectic_model import (
     extract_state_from_segment,
@@ -185,6 +185,157 @@ class SymplecticGlobalModel:
             # Take directional position
             direction = int(np.sign(forecast))
             size_factor = 1.0
+
+        return {
+            "direction": direction,
+            "size_factor": size_factor
+        }
+
+
+class SymplecticUltrametricModel:
+    """
+    Full hybrid model: Ultrametric regimes + per-cluster κ + gating.
+
+    Combines regime detection with symplectic dynamics:
+    - Uses ultrametric distance to find nearest cluster
+    - Applies per-cluster κ for forecasting
+    - Gates signals based on cluster quality (hit rate, distance)
+    - Adjusts position sizing by cluster confidence
+
+    This is the full STEP 4 model.
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        centroids: Dict[int, np.ndarray],
+        kappa_per_cluster: Dict[int, float],
+        hit_rates: Dict[int, float],
+        encoding: str = 'A'
+    ):
+        """
+        Initialize hybrid ultrametric-symplectic model.
+
+        Args:
+            config: Configuration dict
+            centroids: Dict mapping cluster_id -> centroid_segment (K, 2)
+            kappa_per_cluster: Dict mapping cluster_id -> κ value
+            hit_rates: Dict mapping cluster_id -> historical hit rate (0-1)
+            encoding: State encoding ('A', 'B', or 'C')
+        """
+        self.config = config
+        self.centroids = centroids
+        self.kappa_per_cluster = kappa_per_cluster
+        self.hit_rates = hit_rates
+        self.encoding = encoding
+        self.dt = config.get("symplectic", {}).get("dt", 1.0)
+
+        # Gating parameters
+        self.epsilon_gate = config.get("signal", {}).get("epsilon_gate", 1.0)
+        self.hit_threshold = config.get("signal", {}).get("hit_threshold", 0.50)
+
+        # Fallback kappa if cluster not found
+        if len(kappa_per_cluster) > 0:
+            self.kappa_global = np.mean(list(kappa_per_cluster.values()))
+        else:
+            self.kappa_global = 1.0
+
+    def _nearest_cluster(
+        self,
+        seg: np.ndarray
+    ) -> Tuple[int | None, float | None]:
+        """
+        Find nearest cluster centroid using ultrametric distance.
+
+        Args:
+            seg: Segment array, shape (K, 2)
+
+        Returns:
+            (cluster_id, distance) or (None, None) if no valid centroids
+        """
+        from .ultrametric import ultrametric_dist
+
+        if len(self.centroids) == 0:
+            return None, None
+
+        base_b = self.config.get("ultrametric", {}).get("base_b", 1.2)
+        eps = self.config.get("ultrametric", {}).get("eps", 1e-10)
+
+        min_dist = np.inf
+        best_cluster = None
+
+        for cluster_id, centroid in self.centroids.items():
+            d = ultrametric_dist(seg, centroid, base_b, eps)
+            if d < min_dist:
+                min_dist = d
+                best_cluster = cluster_id
+
+        return best_cluster, float(min_dist)
+
+    def get_signal(self, segment: np.ndarray) -> Dict[str, float]:
+        """
+        Generate trading signal from K-bar segment with regime gating.
+
+        Steps:
+        1. Find nearest cluster via ultrametric distance
+        2. Apply gating checks (cluster quality, distance, hit rate)
+        3. Extract (q, π) from segment
+        4. Look up cluster-specific κ
+        5. Apply leapfrog step to forecast
+        6. Generate signal with confidence-based sizing
+
+        Args:
+            segment: Shape (K, 2) with columns [log_price, norm_volume]
+
+        Returns:
+            {
+                "direction": -1 (short), 0 (flat), or 1 (long),
+                "size_factor": Position sizing factor (0.0 to 1.0)
+            }
+        """
+        # 1. Find nearest cluster
+        c_id, dist = self._nearest_cluster(segment)
+
+        # 2. Gating checks
+        if c_id is None:
+            # No valid cluster
+            return {"direction": 0, "size_factor": 0.0}
+
+        if dist > self.epsilon_gate:
+            # Too far from any centroid
+            return {"direction": 0, "size_factor": 0.0}
+
+        hit_rate = self.hit_rates.get(c_id, 0.0)
+        if hit_rate < self.hit_threshold:
+            # Cluster has poor historical performance
+            return {"direction": 0, "size_factor": 0.0}
+
+        # 3. Extract state
+        q, pi = extract_state_from_segment(segment, self.encoding)
+
+        # 4. Get cluster-specific kappa
+        kappa = self.kappa_per_cluster.get(c_id, self.kappa_global)
+
+        # 5. Forecast via leapfrog
+        q_next, pi_next = leapfrog_step(q, pi, kappa, self.dt)
+        forecast = pi_next
+
+        # 6. Apply threshold
+        theta = self.config.get("signal", {}).get("theta_symplectic", 0.0001)
+
+        if abs(forecast) <= theta:
+            return {"direction": 0, "size_factor": 0.0}
+
+        direction = int(np.sign(forecast))
+
+        # 7. Confidence-based sizing
+        # Scale linearly from hit_threshold to hit_threshold + 0.10
+        # e.g., if hit_threshold=0.50, then:
+        #   0.50 -> 0.0
+        #   0.55 -> 0.5
+        #   0.60+ -> 1.0
+        size_factor = (hit_rate - self.hit_threshold) / 0.10
+        size_factor = max(0.0, min(1.0, size_factor))
 
         return {
             "direction": direction,
