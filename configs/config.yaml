@@ -1,0 +1,50 @@
+# Configuration for Ultrametric-Symplectic Regime Model
+# Version: 1.0
+# Timeframe: 15-minute bars only
+
+# Volume processing parameters
+volume:
+  normalization_window: 200  # Bars for rolling mean normalization
+  ema_period: 5              # Period for EMA smoothing
+
+# Signal generation parameters
+signal:
+  theta_ar1: 0.0001          # Threshold for AR(1) signals (in log space)
+  theta_symplectic: 0.0001   # Threshold for symplectic signals (STEP 3+)
+
+# Segment parameters (for STEP 1+)
+segments:
+  K: 10                      # Number of bars per segment
+
+# Ultrametric distance parameters (for STEP 1+)
+ultrametric:
+  base_b: 1.2                # Base for ultrametric valuation (smaller = finer granularity)
+  eps: 1.0e-10               # Small value for numerical stability
+
+# Clustering parameters (for STEP 2+)
+clustering:
+  num_clusters: 5            # Target number of clusters (reduced for better balance)
+  min_cluster_size: 30       # Minimum segments per valid cluster (lowered to keep more clusters)
+  subsample_size: 5000       # Max segments for distance matrix
+
+# Symplectic model parameters (for STEP 3+)
+symplectic:
+  encoding: 'A'              # 'A' (volume), 'B' (price), or 'C' (hybrid)
+  dt: 1.0                    # Time step for leapfrog integrator
+  kappa_min: 0.01            # Minimum allowed kappa
+  kappa_max: 10.0            # Maximum allowed kappa
+
+# Gating parameters for hybrid model (for STEP 4+)
+gating:
+  epsilon_gate: 0.1          # Max distance to centroid for valid regime
+  hit_threshold: 0.52        # Minimum cluster hit rate to trade
+
+# Cost model (15-minute NQ approximation)
+costs:
+  cost_log_15m: -0.00048     # Per round-trip cost in log space (~0.048%)
+
+# Backtesting parameters
+backtest:
+  train_split: 0.6           # Fraction of data for training
+  val_split: 0.2             # Fraction of data for validation
+  test_split: 0.2            # Fraction of data for testing

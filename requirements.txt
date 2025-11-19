@@ -1,0 +1,22 @@
+# Core dependencies for Ultrametric-Symplectic Regime Model
+# Python 3.8+ required
+
+# Data handling
+numpy>=1.21.0
+pandas>=1.3.0
+
+# Configuration
+pyyaml>=5.4.0
+
+# Scientific computing (for later steps)
+scipy>=1.7.0  # For clustering, distance matrices
+
+# Optional but recommended for development
+# jupyter>=1.0.0  # For notebooks
+# matplotlib>=3.4.0  # For visualization
+# seaborn>=0.11.0  # For pretty plots
+
+# Optional for NinjaTrader integration (STEP 6)
+# fastapi>=0.68.0  # For HTTP API
+# uvicorn>=0.15.0  # ASGI server
+# pydantic>=1.8.0  # Data validation
