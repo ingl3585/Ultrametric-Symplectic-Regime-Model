@@ -16,6 +16,12 @@ All models expose a get_signal(...) method that returns:
 import numpy as np
 from typing import Dict
 
+from .symplectic_model import (
+    extract_state_from_segment,
+    leapfrog_step,
+    forecast_next_return
+)
+
 
 class AR1Model:
     """
@@ -111,6 +117,73 @@ class AR1Model:
         else:
             # Take directional position
             direction = int(np.sign(r_hat))
+            size_factor = 1.0
+
+        return {
+            "direction": direction,
+            "size_factor": size_factor
+        }
+
+
+class SymplecticGlobalModel:
+    """
+    Symplectic dynamics model with single global κ.
+
+    Treats market state as a Hamiltonian system:
+    - Position q: Deviation from equilibrium (volume or price based)
+    - Momentum π: Recent price change
+    - H = 0.5*π² + 0.5*κ*q²
+
+    Uses leapfrog integration to forecast next bar's return.
+    """
+
+    def __init__(self, config: dict, kappa: float, encoding: str = 'A'):
+        """
+        Initialize symplectic global model.
+
+        Args:
+            config: Configuration dict
+            kappa: Global stiffness parameter
+            encoding: State encoding ('A', 'B', or 'C')
+        """
+        self.config = config
+        self.kappa = kappa
+        self.encoding = encoding
+        self.dt = config.get("symplectic", {}).get("dt", 1.0)
+
+    def get_signal(self, segment: np.ndarray) -> Dict[str, float]:
+        """
+        Generate trading signal from K-bar segment.
+
+        Steps:
+        1. Extract (q, π) from segment using encoding
+        2. Apply one leapfrog step: (q, π) → (q_next, π_next)
+        3. Use π_next as forecast Δp
+        4. Apply threshold and generate signal
+
+        Args:
+            segment: Shape (K, 2) with columns [log_price, norm_volume]
+
+        Returns:
+            {
+                "direction": -1 (short), 0 (flat), or 1 (long),
+                "size_factor": Position sizing factor (0.0 to 1.0)
+            }
+        """
+        # Forecast next return
+        forecast = forecast_next_return(segment, self.kappa, self.encoding, self.dt)
+
+        # Get threshold from config
+        theta = self.config.get("signal", {}).get("theta_symplectic", 0.0001)
+
+        # Generate signal
+        if abs(forecast) <= theta:
+            # Forecast too small, stay flat
+            direction = 0
+            size_factor = 0.0
+        else:
+            # Take directional position
+            direction = int(np.sign(forecast))
             size_factor = 1.0
 
         return {

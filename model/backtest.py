@@ -195,3 +195,111 @@ def _compute_metrics(trades: List[Trade], equity_curve: List[float]) -> Dict:
         "avg_loss": float(avg_loss),
         "profit_factor": float(profit_factor)
     }
+
+
+def run_symplectic_backtest(
+    model,  # SymplecticGlobalModel or SymplecticUltrametricModel
+    segments: np.ndarray,
+    p: np.ndarray,
+    K: int,
+    cost_log: float
+) -> Dict:
+    """
+    Backtest symplectic model on segments.
+
+    Uses K-bar segments as inputs to model.get_signal().
+    Applies cost_log on every position change.
+
+    Args:
+        model: SymplecticGlobalModel or SymplecticUltrametricModel
+        segments: Segment array, shape (M, K, 2)
+        p: Log prices, shape (N,) where N = M + K - 1
+        K: Segment length
+        cost_log: Per-round-trip cost in log space
+
+    Returns:
+        Dictionary with trades, equity_curve, and metrics
+    """
+    M = len(segments)
+    position = 0  # Start flat
+    equity = 0.0
+    equity_curve = [0.0]
+
+    trades: List[Trade] = []
+    current_trade_entry_idx = None
+    current_trade_entry_price = None
+
+    # Start from bar K (first segment ends at bar K-1, we trade at bar K)
+    for t in range(K, len(p)):
+        # Get segment ending at t-1 (bars [t-K:t])
+        seg_idx = t - K
+        if seg_idx >= M:
+            break
+
+        segment = segments[seg_idx]
+
+        # Get signal from model
+        signal = model.get_signal(segment)
+        new_position = signal["direction"]
+
+        # Check if position changes
+        if new_position != position:
+            # Exit current position if any
+            if position != 0:
+                # Realize PnL on the exit
+                price_change = p[t] - current_trade_entry_price
+                gross_pnl = position * price_change
+
+                # Apply cost for the round trip
+                net_pnl = gross_pnl + cost_log
+
+                # Record trade
+                trades.append(Trade(
+                    entry_idx=current_trade_entry_idx,
+                    exit_idx=t,
+                    direction=position,
+                    entry_price=current_trade_entry_price,
+                    exit_price=p[t],
+                    pnl=gross_pnl,
+                    net_pnl=net_pnl
+                ))
+
+                # Update equity
+                equity += net_pnl
+
+            # Enter new position if not flat
+            if new_position != 0:
+                current_trade_entry_idx = t
+                current_trade_entry_price = p[t]
+
+            position = new_position
+
+        equity_curve.append(equity)
+
+    # Close any open position at the end
+    if position != 0:
+        price_change = p[-1] - current_trade_entry_price
+        gross_pnl = position * price_change
+        net_pnl = gross_pnl + cost_log
+
+        trades.append(Trade(
+            entry_idx=current_trade_entry_idx,
+            exit_idx=len(p) - 1,
+            direction=position,
+            entry_price=current_trade_entry_price,
+            exit_price=p[-1],
+            pnl=gross_pnl,
+            net_pnl=net_pnl
+        ))
+
+        equity += net_pnl
+        equity_curve[-1] = equity
+
+    # Compute metrics
+    metrics = _compute_metrics(trades, equity_curve)
+
+    return {
+        "trades": trades,
+        "equity_curve": np.array(equity_curve),
+        "metrics": metrics
+    }
