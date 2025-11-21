@@ -15,9 +15,8 @@ volume:
 signal:
   theta_ar1: 0.0001          # Threshold for AR(1) signals (in log space)
   theta_symplectic: 0.00005  # Threshold for symplectic signals - balanced
-  theta_ml: 0.0005           # Threshold for ML regressor mode signals (in log space)
   epsilon_gate: 2.0          # Max ultrametric distance to centroid - balanced
-  hit_threshold: 0.45        # Minimum cluster hit rate to trade (40% = better than random)
+  hit_threshold: 0.52        # Minimum cluster hit rate to trade (52% = positive expectancy after costs)
 
 # Segment parameters (for STEP 1+)
 segments:
@@ -34,22 +33,12 @@ clustering:
   min_cluster_size: 30       # Minimum segments per valid cluster (lowered to keep more clusters)
   subsample_size: 5000       # Max segments for distance matrix
 
-# Symplectic model parameters (for STEP 3+)
+# Symplectic model parameters
 symplectic:
   encoding: 'A'              # 'A' (volume), 'B' (price), or 'C' (hybrid)
   dt: 1.0                    # Time step for leapfrog integrator
   kappa_min: 0.01            # Minimum allowed kappa
   kappa_max: 10.0            # Maximum allowed kappa
-
-# ML combiner layer parameters (optional enhancement)
-ml:
-  enabled: true              # Enable ML combiner layer (set to false for pure math model)
-  type: "classifier"         # "classifier" (predict direction) or "regressor" (predict return)
-  hidden_sizes: [48, 24]     # Hidden layer sizes for MLP
-  retrain_interval: 1000     # Retrain model every N bars
-  min_training_samples: 250  # Minimum samples before first training (lowered for 3m data)
-  min_confidence: 0.50       # Minimum ML probability to trade (50% = better than random)
-  min_size_factor: 0.0       # Let size_factor formula naturally determine position size
 
 # Cost model (NQ approximation)
 costs:

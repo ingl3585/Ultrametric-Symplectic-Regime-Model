@@ -100,7 +100,7 @@ def assign_to_nearest_centroid(
         best_cluster = -1
 
         for cluster_id, centroid in centroids.items():
-            d = ultrametric_dist(segments[i], centroid, base_b, eps)
+            d = ultrametric_dist(segments[i], centroid, base_b, eps, use_multi_scale=True)
             if d < min_dist:
                 min_dist = d
                 best_cluster = cluster_id
