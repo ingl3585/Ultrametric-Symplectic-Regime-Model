@@ -418,3 +418,193 @@ def run_hybrid_backtest(
         "equity_curve": np.array(equity_curve),
         "metrics": metrics
     }
+
+
+def run_hybrid_ml_backtest(
+    model,  # HybridMLModel
+    p: np.ndarray,
+    v: np.ndarray,
+    K: int,
+    cluster_stats: Dict[int, Dict],
+    cost_log: float,
+    warmup_bars: int = 500
+) -> Dict:
+    """
+    Backtest HybridMLModel with online learning.
+
+    Similar to run_hybrid_backtest, but:
+    - Passes full p, v arrays and bar index to model.get_signal()
+    - Adds training examples after each bar (realized return)
+    - Periodically retrains the ML model
+    - Uses warmup period to accumulate training data before trading
+
+    Args:
+        model: HybridMLModel instance
+        p: Log prices, shape (N,)
+        v: Normalized volumes, shape (N,)
+        K: Segment length
+        cluster_stats: Cluster statistics dict from trainer
+        cost_log: Per-round-trip cost in log space
+        warmup_bars: Number of bars to collect training data before trading
+
+    Returns:
+        Dictionary with trades, equity_curve, and metrics
+    """
+    from .data_utils import build_gamma
+    from .trainer import build_segments
+
+    # Build gamma and segments
+    gamma = build_gamma(p, v)
+    segments = build_segments(gamma, K)
+    M = len(segments)
+
+    position = 0  # Start flat
+    equity = 0.0
+    equity_curve = [0.0]
+
+    trades: List[Trade] = []
+    current_trade_entry_idx = None
+    current_trade_entry_price = None
+
+    # Track signals and returns for training
+    signal_history: List[Dict] = []
+
+    # Start from bar K (first segment ends at bar K-1, we trade at bar K)
+    for t in range(K, len(p)):
+        # Get segment ending at t-1 (bars [t-K:t])
+        seg_idx = t - K
+        if seg_idx >= M:
+            break
+
+        segment = segments[seg_idx]
+
+        # Get signal from model (passes full arrays for feature extraction)
+        signal = model.get_signal(
+            segment=segment,
+            p_full=p,
+            v_full=v,
+            t=t - 1,  # Current segment ends at t-1
+            cluster_stats=cluster_stats,
+            force_fallback=False
+        )
+
+        # Add training example if we have a previous bar
+        if t > K:
+            # Realized return from last bar
+            realized_return = p[t] - p[t - 1]
+
+            # Extract features from previous segment for training
+            prev_seg_idx = seg_idx - 1
+            if prev_seg_idx >= 0 and prev_seg_idx < M:
+                prev_segment = segments[prev_seg_idx]
+
+                # Import here to avoid circular dependency
+                from .features import extract_feature_vector
+                from .symplectic_model import extract_state_from_segment, leapfrog_step
+
+                # Get base model internals
+                nearest = model.base_model._nearest_cluster(prev_segment)
+                c_id, dist = (nearest[0], nearest[1]) if nearest[0] is not None else (None, None)
+                gating_passed = model.base_model._passes_gating(c_id, dist, cluster_stats)
+                kappa = model.base_model.kappa_per_cluster.get(c_id, model.base_model.kappa_global)
+
+                # Extract state and forecasts
+                q, pi = extract_state_from_segment(prev_segment, model.base_model.encoding)
+                q_next, pi_next_1step = leapfrog_step(q, pi, kappa, dt=1.0)
+                q_next2, pi_next_2step = leapfrog_step(q_next, pi_next_1step, kappa, dt=1.0)
+
+                # Extract features
+                features = extract_feature_vector(
+                    segment=prev_segment,
+                    nearest_cluster_id=c_id,
+                    distance_to_centroid=dist,
+                    cluster_stats=cluster_stats,
+                    kappa_shrunk=kappa,
+                    pi_next_1step=pi_next_1step,
+                    pi_next_2step=pi_next_1step + pi_next_2step,
+                    gating_passed=gating_passed,
+                    p_full=p,
+                    v_full=v,
+                    t=t - 2,
+                    config=model.config
+                )
+
+                # Add training example
+                model._add_training_example(features, realized_return)
+
+        # Retrain model periodically
+        model.retrain_if_needed(current_bar_idx=t, force=False)
+
+        # Only trade after warmup period
+        if t < K + warmup_bars:
+            equity_curve.append(equity)
+            continue
+
+        new_position = signal["direction"]
+
+        # Check if position changes
+        if new_position != position:
+            # Exit current position if any
+            if position != 0:
+                # Realize PnL on the exit
+                price_change = p[t] - current_trade_entry_price
+                gross_pnl = position * price_change
+
+                # Apply cost for the round trip
+                net_pnl = gross_pnl + cost_log
+
+                # Record trade
+                trades.append(Trade(
+                    entry_idx=current_trade_entry_idx,
+                    exit_idx=t,
+                    direction=position,
+                    entry_price=current_trade_entry_price,
+                    exit_price=p[t],
+                    pnl=gross_pnl,
+                    net_pnl=net_pnl
+                ))
+
+                # Update equity
+                equity += net_pnl
+
+            # Enter new position if not flat
+            if new_position != 0:
+                current_trade_entry_idx = t
+                current_trade_entry_price = p[t]
+
+            position = new_position
+
+        equity_curve.append(equity)
+
+    # Close any open position at the end
+    if position != 0:
+        price_change = p[-1] - current_trade_entry_price
+        gross_pnl = position * price_change
+        net_pnl = gross_pnl + cost_log
+
+        trades.append(Trade(
+            entry_idx=current_trade_entry_idx,
+            exit_idx=len(p) - 1,
+            direction=position,
+            entry_price=current_trade_entry_price,
+            exit_price=p[-1],
+            pnl=gross_pnl,
+            net_pnl=net_pnl
+        ))
+
+        equity += net_pnl
+        equity_curve[-1] = equity
+
+    # Compute metrics
+    metrics = _compute_metrics(trades, equity_curve)
+
+    # Add ML-specific metrics
+    metrics["warmup_bars"] = warmup_bars
+    metrics["training_samples_collected"] = len(model.X_hist)
+    metrics["ml_model_fitted"] = model.is_fitted
+
+    return {
+        "trades": trades,
+        "equity_curve": np.array(equity_curve),
+        "metrics": metrics
+    }

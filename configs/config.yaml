@@ -1,22 +1,27 @@
 # Configuration for Ultrametric-Symplectic Regime Model
-# Version: 1.0
-# Timeframe: 15-minute bars only
+# Version: 1.1
+# Timeframe: Configurable (1-minute or 15-minute bars)
+
+# Timeframe configuration
+timeframe:
+  bar_size_minutes: 3        # Bar size in minutes (3m = good balance between 1m and 15m)
 
 # Volume processing parameters
 volume:
-  normalization_window: 200  # Bars for rolling mean normalization
-  ema_period: 5              # Period for EMA smoothing
+  normalization_window: 400   # Bars for rolling mean normalization (400 bars @ 3m = 20 hours)
+  ema_period: 5               # Period for EMA smoothing
 
 # Signal generation parameters
 signal:
   theta_ar1: 0.0001          # Threshold for AR(1) signals (in log space)
-  theta_symplectic: 0.0001   # Threshold for symplectic signals (STEP 3+)
-  epsilon_gate: 1.0          # Max ultrametric distance to centroid for valid regime (STEP 4+)
-  hit_threshold: 0.50        # Minimum cluster hit rate to trade (STEP 4+)
+  theta_symplectic: 0.00005  # Threshold for symplectic signals - balanced
+  theta_ml: 0.0005           # Threshold for ML regressor mode signals (in log space)
+  epsilon_gate: 2.0          # Max ultrametric distance to centroid - balanced
+  hit_threshold: 0.45        # Minimum cluster hit rate to trade (40% = better than random)
 
 # Segment parameters (for STEP 1+)
 segments:
-  K: 10                      # Number of bars per segment
+  K: 20                      # Number of bars per segment (20 bars @ 3m = 60 minutes = 1 hour)
 
 # Ultrametric distance parameters (for STEP 1+)
 ultrametric:
@@ -36,9 +41,19 @@ symplectic:
   kappa_min: 0.01            # Minimum allowed kappa
   kappa_max: 10.0            # Maximum allowed kappa
 
-# Cost model (15-minute NQ approximation)
+# ML combiner layer parameters (optional enhancement)
+ml:
+  enabled: true              # Enable ML combiner layer (set to false for pure math model)
+  type: "classifier"         # "classifier" (predict direction) or "regressor" (predict return)
+  hidden_sizes: [48, 24]     # Hidden layer sizes for MLP
+  retrain_interval: 1000     # Retrain model every N bars
+  min_training_samples: 250  # Minimum samples before first training (lowered for 3m data)
+  min_confidence: 0.50       # Minimum ML probability to trade (50% = better than random)
+  min_size_factor: 0.0       # Let size_factor formula naturally determine position size
+
+# Cost model (NQ approximation)
 costs:
-  cost_log_15m: -0.00048     # Per round-trip cost in log space (~0.048%)
+  cost_per_trade: -0.00048   # Per round-trip cost in log space (~0.048%, same for 1m and 15m)
 
 # Backtesting parameters
 backtest:

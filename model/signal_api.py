@@ -272,6 +272,44 @@ class SymplecticUltrametricModel:
 
         return best_cluster, float(min_dist)
 
+    def _passes_gating(
+        self,
+        cluster_id: int | None,
+        distance: float | None,
+        cluster_stats: Dict[int, Dict] = None
+    ) -> bool:
+        """
+        Check if segment passes gating criteria.
+
+        Args:
+            cluster_id: Cluster ID (or None if no cluster found)
+            distance: Distance to centroid (or None)
+            cluster_stats: Optional override cluster stats dict
+
+        Returns:
+            True if passes gating, False otherwise
+        """
+        # No valid cluster
+        if cluster_id is None:
+            return False
+
+        # Too far from centroid
+        if distance is not None and distance > self.epsilon_gate:
+            return False
+
+        # Check hit rate
+        if cluster_stats is not None:
+            # Use provided cluster_stats (for ML model)
+            hit_rate = cluster_stats.get(cluster_id, {}).get('hit_rate', 0.0)
+        else:
+            # Use model's internal hit_rates
+            hit_rate = self.hit_rates.get(cluster_id, 0.0)
+
+        if hit_rate < self.hit_threshold:
+            return False
+
+        return True
+
     def get_signal(self, segment: np.ndarray) -> Dict[str, float]:
         """
         Generate trading signal from K-bar segment with regime gating.
@@ -297,18 +335,10 @@ class SymplecticUltrametricModel:
         c_id, dist = self._nearest_cluster(segment)
 
         # 2. Gating checks
-        if c_id is None:
-            # No valid cluster
-            return {"direction": 0, "size_factor": 0.0}
-
-        if dist > self.epsilon_gate:
-            # Too far from any centroid
+        if not self._passes_gating(c_id, dist):
             return {"direction": 0, "size_factor": 0.0}
 
         hit_rate = self.hit_rates.get(c_id, 0.0)
-        if hit_rate < self.hit_threshold:
-            # Cluster has poor historical performance
-            return {"direction": 0, "size_factor": 0.0}
 
         # 3. Extract state
         q, pi = extract_state_from_segment(segment, self.encoding)
@@ -340,4 +370,247 @@ class SymplecticUltrametricModel:
         return {
             "direction": direction,
             "size_factor": size_factor
+        }
+
+
+class HybridMLModel:
+    """
+    ML Combiner Layer on top of SymplecticUltrametricModel.
+
+    Uses scikit-learn MLPClassifier or MLPRegressor to learn from the pure math
+    model's intermediate features + market microstructure.
+
+    Training is done online (incremental) with periodic retraining.
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        base_model: "SymplecticUltrametricModel",   # The pure math model
+        ml_type: str = "classifier"                  # "classifier" or "regressor"
+    ):
+        """
+        Initialize HybridMLModel.
+
+        Args:
+            config: Full config dict
+            base_model: Trained SymplecticUltrametricModel instance
+            ml_type: "classifier" (predict direction) or "regressor" (predict return)
+        """
+        from sklearn.neural_network import MLPClassifier, MLPRegressor
+        from sklearn.preprocessing import StandardScaler
+
+        self.config = config
+        self.base_model = base_model
+        self.ml_type = ml_type
+        self.scaler = StandardScaler()
+        self.is_fitted = False
+        self.X_hist = []
+        self.y_hist = []
+
+        # Get ML config
+        ml_config = config.get("ml", {})
+        hidden_sizes = tuple(ml_config.get("hidden_sizes", [48, 24]))
+
+        if ml_type == "classifier":
+            self.model = MLPClassifier(
+                hidden_layer_sizes=hidden_sizes,
+                max_iter=500,
+                early_stopping=True,
+                n_iter_no_change=20,
+                random_state=42,
+                verbose=False
+            )
+        else:
+            self.model = MLPRegressor(
+                hidden_layer_sizes=hidden_sizes,
+                max_iter=500,
+                early_stopping=True,
+                n_iter_no_change=20,
+                random_state=42,
+                verbose=False
+            )
+
+    def _add_training_example(self, features: np.ndarray, target: float):
+        """
+        Add a training example (feature vector, realized return).
+
+        Args:
+            features: Feature vector (25-dim)
+            target: Realized next-bar return (for training)
+        """
+        self.X_hist.append(features)
+        self.y_hist.append(target)
+
+    def retrain_if_needed(self, current_bar_idx: int, force: bool = False):
+        """
+        Retrain ML model if enough examples accumulated.
+
+        Args:
+            current_bar_idx: Current bar index in backtest
+            force: Force retraining regardless of interval
+        """
+        ml_config = self.config.get("ml", {})
+        retrain_interval = ml_config.get("retrain_interval", 1000)
+        min_samples = ml_config.get("min_training_samples", 500)
+
+        # Check if we should retrain
+        should_retrain = (
+            force or
+            (not self.is_fitted and len(self.X_hist) >= min_samples) or  # Initial training
+            (current_bar_idx % retrain_interval == 0 and len(self.X_hist) >= min_samples)  # Periodic retraining
+        )
+
+        if not should_retrain:
+            return
+
+        if len(self.X_hist) < min_samples:
+            return
+
+        # Prepare training data
+        X = np.array(self.X_hist)
+        y = np.array(self.y_hist)
+
+        if self.ml_type == "classifier":
+            # Convert returns to directional labels: -1, 0, +1
+            y_class = np.sign(y)
+        else:
+            y_class = y
+
+        # Fit scaler and model
+        X_scaled = self.scaler.fit_transform(X)
+
+        try:
+            self.model.fit(X_scaled, y_class)
+            self.is_fitted = True
+        except Exception as e:
+            print(f"Warning: ML model training failed: {e}")
+            self.is_fitted = False
+
+        # Optional: Keep only recent N examples to save memory
+        # max_history = 100_000
+        # if len(self.X_hist) > max_history:
+        #     self.X_hist = self.X_hist[-max_history:]
+        #     self.y_hist = self.y_hist[-max_history:]
+
+    def get_signal(
+        self,
+        segment: np.ndarray,
+        p_full: np.ndarray,
+        v_full: np.ndarray,
+        t: int,
+        cluster_stats: Dict[int, any],
+        force_fallback: bool = False
+    ) -> Dict[str, float]:
+        """
+        Generate trading signal using ML model.
+
+        Args:
+            segment: (K, 2) segment [p, v]
+            p_full: Full log-price series
+            v_full: Full normalized volume series
+            t: Current bar index
+            cluster_stats: Dict of cluster statistics
+            force_fallback: If True, use pure math model
+
+        Returns:
+            {"direction": int, "size_factor": float}
+        """
+        from .features import extract_feature_vector
+
+        # Get base model's intermediate values
+        nearest = self.base_model._nearest_cluster(segment)
+        c_id, dist = (nearest[0], nearest[1]) if nearest[0] is not None else (None, None)
+
+        gating_passed = self.base_model._passes_gating(c_id, dist, cluster_stats)
+
+        kappa = self.base_model.kappa_per_cluster.get(
+            c_id,
+            self.base_model.kappa_global
+        )
+
+        # Extract state and compute forecasts
+        q, pi = extract_state_from_segment(segment, self.base_model.encoding)
+
+        # 1-step and 2-step forecasts
+        q_next, pi_next_1step = leapfrog_step(q, pi, kappa, dt=1.0)
+        q_next2, pi_next_2step = leapfrog_step(q_next, pi_next_1step, kappa, dt=1.0)
+
+        # Extract features
+        features = extract_feature_vector(
+            segment=segment,
+            nearest_cluster_id=c_id,
+            distance_to_centroid=dist,
+            cluster_stats=cluster_stats,
+            kappa_shrunk=kappa,
+            pi_next_1step=pi_next_1step,
+            pi_next_2step=pi_next_1step + pi_next_2step,  # Cumulative 2-step
+            gating_passed=gating_passed,
+            p_full=p_full,
+            v_full=v_full,
+            t=t,
+            config=self.config
+        )
+
+        # Fallback conditions
+        if force_fallback or not self.is_fitted or not gating_passed:
+            # Use pure math model
+            result = self.base_model.get_signal(segment)
+            result['ml_confidence'] = 0.0  # No ML confidence in fallback
+            return result
+
+        # Use ML model
+        X = self.scaler.transform(features.reshape(1, -1))
+
+        if self.ml_type == "classifier":
+            # Predict direction
+            try:
+                proba = self.model.predict_proba(X)[0]
+                # Assumes class order: [-1, 0, +1] after sklearn's label sorting
+                # Get class labels
+                classes = self.model.classes_
+                direction_idx = np.argmax(proba)
+                direction = int(classes[direction_idx])
+                confidence = np.max(proba)
+            except Exception as e:
+                # Fallback to base model if prediction fails
+                result = self.base_model.get_signal(segment)
+                result['ml_confidence'] = 0.0
+                return result
+
+        else:  # regressor
+            # Predict return
+            try:
+                pred_ret = self.model.predict(X)[0]
+                theta_ml = self.config.get("signal", {}).get("theta_ml", 0.0005)
+
+                if abs(pred_ret) <= theta_ml:
+                    direction = 0
+                    confidence = 0.0
+                else:
+                    direction = 1 if pred_ret > 0 else -1
+                    confidence = min(1.0, abs(pred_ret) / (3 * theta_ml))
+            except Exception as e:
+                result = self.base_model.get_signal(segment)
+                result['ml_confidence'] = 0.0
+                return result
+
+        # Size factor based on confidence and cluster hit rate
+        hit_rate = cluster_stats.get(c_id, {}).get('hit_rate', 0.5) if c_id is not None else 0.5
+        size_factor = confidence * (hit_rate - 0.5) / 0.05
+        size_factor = np.clip(size_factor, 0.0, 1.0)
+
+        # ML-specific gating: Check minimum confidence and size_factor thresholds
+        ml_config = self.config.get('ml', {})
+        min_confidence = ml_config.get('min_confidence', 0.5)
+        min_size_factor = ml_config.get('min_size_factor', 0.0)
+
+        # If confidence or size_factor too low, don't trade (or fallback to base model)
+        if confidence < min_confidence or size_factor < min_size_factor:
+            return {"direction": 0, "size_factor": 0.0, "ml_confidence": float(confidence)}
+
+        return {
+            "direction": int(direction) if abs(direction) == 1 else 0,
+            "size_factor": float(size_factor),
+            "ml_confidence": float(confidence)
         }

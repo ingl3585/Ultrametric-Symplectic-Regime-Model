@@ -5,10 +5,11 @@ This module handles:
 - Building K-bar segments from phase-space data
 - Orchestrating training flows (segments → clustering → kappa estimation)
 - Preparing data for regime detection and symplectic models
+- Computing cluster statistics for ML feature extraction
 """
 
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Dict, Any
 
 
 def build_segments(gamma: np.ndarray, K: int) -> np.ndarray:
@@ -110,3 +111,171 @@ def validate_segments(segments: np.ndarray, K: int) -> bool:
         raise ValueError("Segments contain NaN or Inf values")
 
     return True
+
+
+def compute_cluster_stats(
+    segments: np.ndarray,
+    labels: np.ndarray,
+    config: dict,
+    forecasts: np.ndarray = None,
+    actual_returns: np.ndarray = None
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Compute cluster statistics for ML feature extraction.
+
+    Computes per-cluster:
+    - persistence: P(cluster_t+1 = c | cluster_t = c)
+    - hit_rate: Directional accuracy (if forecasts provided)
+    - size: Number of segments in cluster
+    - raw_kappa: Cluster-specific kappa value
+
+    Args:
+        segments: Segment array, shape (M, K, 2)
+        labels: Cluster labels, shape (M,)
+        config: Configuration dict
+        forecasts: Optional forecast values, shape (M,) for hit rate calculation
+        actual_returns: Optional actual returns, shape (M,) for hit rate calculation
+
+    Returns:
+        cluster_stats: Dict mapping cluster_id to statistics dict
+            {
+                cluster_id: {
+                    'persistence': float,
+                    'hit_rate': float,
+                    'size': int,
+                    'raw_kappa': float
+                },
+                ...
+            }
+    """
+    from .clustering import compute_persistence
+    from .symplectic_model import estimate_kappa_per_cluster
+
+    # Get unique clusters
+    unique_clusters = np.unique(labels)
+    cluster_stats = {}
+
+    # Compute persistence for all clusters
+    persistence_dict = compute_persistence(labels)
+
+    # Compute raw kappa per cluster
+    encoding = config.get('symplectic', {}).get('encoding', 'A')
+    kappa_dict = estimate_kappa_per_cluster(segments, labels, encoding=encoding)
+
+    # Compute hit rate if forecasts and actual returns provided
+    hit_rate_dict = {}
+    if forecasts is not None and actual_returns is not None:
+        for cluster_id in unique_clusters:
+            mask = labels == cluster_id
+            if mask.sum() > 0:
+                cluster_forecasts = forecasts[mask]
+                cluster_actuals = actual_returns[mask]
+
+                # Directional hit rate
+                forecast_direction = np.sign(cluster_forecasts)
+                actual_direction = np.sign(cluster_actuals)
+                correct = (forecast_direction == actual_direction)
+                hit_rate = np.mean(correct)
+                hit_rate_dict[cluster_id] = hit_rate
+            else:
+                hit_rate_dict[cluster_id] = 0.5  # Default
+
+    # Build cluster stats dict
+    for cluster_id in unique_clusters:
+        mask = labels == cluster_id
+        size = int(np.sum(mask))
+
+        cluster_stats[cluster_id] = {
+            'persistence': persistence_dict.get(cluster_id, 0.5),
+            'hit_rate': hit_rate_dict.get(cluster_id, 0.5) if hit_rate_dict else 0.5,
+            'size': size,
+            'raw_kappa': kappa_dict.get(cluster_id, 0.01)
+        }
+
+    return cluster_stats
+
+
+def compute_hit_rates_from_data(
+    segments: np.ndarray,
+    labels: np.ndarray,
+    p_full: np.ndarray,
+    config: dict
+) -> Dict[int, float]:
+    """
+    Compute directional hit rates per cluster using symplectic forecasts.
+
+    For each segment, computes 1-step forecast and compares to actual return.
+
+    Args:
+        segments: Segment array, shape (M, K, 2)
+        labels: Cluster labels, shape (M,)
+        p_full: Full log price series, shape (N,) where N >= M+K
+        config: Configuration dict
+
+    Returns:
+        hit_rates: Dict mapping cluster_id to directional hit rate
+    """
+    from .symplectic_model import extract_state_from_segment, leapfrog_step, estimate_kappa_per_cluster
+
+    M = len(segments)
+    K = segments.shape[1]
+
+    # Compute kappa per cluster
+    encoding = config.get('symplectic', {}).get('encoding', 'A')
+    kappa_dict = estimate_kappa_per_cluster(segments, labels, encoding=encoding)
+
+    # Get global kappa fallback
+    kappa_global = np.mean(list(kappa_dict.values()))
+
+    # Compute forecasts and actual returns
+    forecasts = []
+    actuals = []
+    forecast_labels = []
+
+    for i in range(M):
+        segment = segments[i]
+        cluster_id = labels[i]
+
+        # Extract state
+        q, pi = extract_state_from_segment(segment, encoding=encoding)
+
+        # Get kappa
+        kappa = kappa_dict.get(cluster_id, kappa_global)
+
+        # Forecast next momentum
+        _, pi_next = leapfrog_step(q, pi, kappa, dt=1.0)
+        forecasts.append(pi_next)
+        forecast_labels.append(cluster_id)
+
+        # Actual return (if available)
+        t = i + K  # Bar index after segment
+        if t < len(p_full):
+            actual_return = p_full[t] - p_full[t - 1]
+            actuals.append(actual_return)
+        else:
+            actuals.append(0.0)
+
+    forecasts = np.array(forecasts)
+    actuals = np.array(actuals)
+    forecast_labels = np.array(forecast_labels)
+
+    # Compute hit rate per cluster
+    unique_clusters = np.unique(labels)
+    hit_rates = {}
+
+    for cluster_id in unique_clusters:
+        mask = forecast_labels == cluster_id
+        if mask.sum() > 0:
+            cluster_forecasts = forecasts[mask]
+            cluster_actuals = actuals[mask]
+
+            # Directional accuracy
+            forecast_direction = np.sign(cluster_forecasts)
+            actual_direction = np.sign(cluster_actuals)
+            correct = (forecast_direction == actual_direction)
+            hit_rate = np.mean(correct)
+            hit_rates[cluster_id] = float(hit_rate)
+        else:
+            hit_rates[cluster_id] = 0.5
+
+    return hit_rates
