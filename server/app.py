@@ -24,6 +24,7 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 import logging
+import csv
 
 # Import our model components
 import sys
@@ -32,7 +33,13 @@ sys.path.append(str(Path(__file__).parent.parent))
 from model.data_utils import build_gamma
 from model.trainer import build_segments
 from model.clustering import assign_to_nearest_centroid, compute_centroids
-from model.symplectic_model import estimate_global_kappa, estimate_kappa_per_cluster
+from model.symplectic_model import (
+    estimate_global_kappa,
+    estimate_kappa_per_cluster,
+    extract_state_from_segment,
+    leapfrog_step,
+    hamiltonian
+)
 from model.signal_api import SymplecticGlobalModel, SymplecticUltrametricModel
 
 # Setup logging
@@ -261,10 +268,29 @@ async def get_signal(request: SignalRequest):
         # Build segment
         gamma = np.stack([p, v_smooth], axis=1)  # Shape (K, 2)
 
+        # Extract phase space state for diagnostics
+        encoding = model_state.config['symplectic']['encoding']
+        q, pi = extract_state_from_segment(gamma, encoding=encoding)
+
+        # Get model kappa
+        kappa = 0.0100  # Global kappa from training
+
+        # Compute Hamiltonian before
+        H_before = hamiltonian(q, pi, kappa)
+
+        # Compute next state via leapfrog
+        q_next, pi_next = leapfrog_step(q, pi, kappa, dt=1.0)
+
+        # Compute Hamiltonian after
+        H_after = hamiltonian(q_next, pi_next, kappa)
+
+        # Energy drift
+        energy_drift = abs(H_after - H_before)
+
         # Get signal from model
         signal = model_state.model.get_signal(gamma)
 
-        # Prepare response
+        # Prepare response with phase space diagnostics
         response = SignalResponse(
             direction=signal["direction"],
             size_factor=signal["size_factor"],
@@ -275,11 +301,49 @@ async def get_signal(request: SignalRequest):
                 "bars_used": K,
                 "instrument": request.instrument,
                 "last_close": float(closes[-1]),
-                "last_volume": float(volumes[-1])
+                "last_volume": float(volumes[-1]),
+                "phase_space": {
+                    "q": float(q),
+                    "pi": float(pi),
+                    "q_next": float(q_next),
+                    "pi_next": float(pi_next),
+                    "H_before": float(H_before),
+                    "H_after": float(H_after),
+                    "energy_drift": float(energy_drift),
+                    "kappa": float(kappa),
+                    "encoding": encoding,
+                    "forecast": float(pi_next)
+                }
             }
         )
 
-        logger.info(f"Signal generated: direction={response.direction}, size={response.size_factor:.2f}")
+        # Log phase space data to CSV
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        log_file = log_dir / f"phase_space_{datetime.now().strftime('%Y%m%d')}.csv"
+
+        # Write header if file is new
+        write_header = not log_file.exists()
+
+        with open(log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow([
+                    'timestamp', 'instrument', 'q', 'pi', 'q_next', 'pi_next',
+                    'H_before', 'H_after', 'energy_drift', 'kappa', 'encoding',
+                    'forecast', 'direction', 'size_factor', 'last_close', 'last_volume'
+                ])
+            writer.writerow([
+                response.timestamp,
+                request.instrument,
+                q, pi, q_next, pi_next,
+                H_before, H_after, energy_drift, kappa, encoding,
+                pi_next, signal["direction"], signal["size_factor"],
+                closes[-1], volumes[-1]
+            ])
+
+        logger.info(f"Signal generated: direction={response.direction}, size={response.size_factor:.2f}, "
+                   f"phase_space: q={q:.4f}, π={pi:.4f}, H={H_before:.6f}, forecast={pi_next:.4f}")
         return response
 
     except HTTPException:
